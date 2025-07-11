@@ -1,0 +1,16 @@
+// .vscode/launch.json snippet
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python: Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal"
+    }
+  ]
+}
+// This configuration allows you to run the current Python file in the integrated terminal.
+// You can add more configurations for different environments or debugging scenarios as needed.
+// To use this, save it in a file named `launch.json` inside a `.vscode` folder in your project directory.
