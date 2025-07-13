@@ -25,7 +25,7 @@ class ClassificationLoss(nn.Module):
         Returns:
             tensor, scalar loss
         """
-        print(f"Cross Entropy Loss = {nn.CrossEntropyLoss()(logits, target)}")
+        #print(f"Cross Entropy Loss = {nn.CrossEntropyLoss()(logits, target)}")
         return nn.CrossEntropyLoss()(logits, target)
     
         raise NotImplementedError("ClassificationLoss.forward() is not implemented")
