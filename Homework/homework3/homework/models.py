@@ -27,7 +27,19 @@ class Classifier(nn.Module):
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
         # TODO: implement
-        pass
+        # Example: a simple CNN architecture
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=3, stride=1, padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
+        
+        # Input is 64x64, after 3 max pools (2x2, stride=2): 64/8 = 8
+        # So final conv output is 128 channels * 8 * 8 = 8192
+        self.fc1 = nn.Linear(128 * 8 * 8, 256)
+        self.fc2 = nn.Linear(256, num_classes)
+        
+        self.relu = nn.ReLU()
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+        self.dropout = nn.Dropout(0.5)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -40,8 +52,18 @@ class Classifier(nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 6)
+        # Forward pass through conv layers
+        z = self.pool(self.relu(self.conv1(z)))  # 64x64 -> 32x32
+        z = self.pool(self.relu(self.conv2(z)))  # 32x32 -> 16x16  
+        z = self.pool(self.relu(self.conv3(z)))  # 16x16 -> 8x8
+        
+        # Flatten for fully connected layers
+        z = z.view(z.size(0), -1)  # (batch, 128*8*8)
+        
+        # Fully connected layers
+        z = self.relu(self.fc1(z))
+        z = self.dropout(z)
+        logits = self.fc2(z)
 
         return logits
 
