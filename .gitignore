@@ -51,7 +51,7 @@ logs/
 # 5. Large datasets & generated data
 ############################################
 #data/                  # raw data (put in DVC/cloud storage instead)
-datasets/
+#datasets/
 *.csv
 *.tsv
 *.jsonl
