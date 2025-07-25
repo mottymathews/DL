@@ -82,6 +82,30 @@ class Classifier(nn.Module):
         return self(x).argmax(dim=1)
 
 
+class DownBlock(nn.Module):
+    """Downsampling block with conv + batchnorm + relu + stride"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x):
+        return self.relu(self.bn(self.conv(x)))
+
+
+class UpBlock(nn.Module):
+    """Upsampling block with transpose conv + batchnorm + relu"""
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.upconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1)
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+    def forward(self, x):
+        return self.relu(self.bn(self.upconv(x)))
+
+
 class Detector(torch.nn.Module):
     def __init__(
         self,
@@ -100,8 +124,20 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # TODO: implement
-        pass
+        # Encoder (downsampling path)
+        self.down1 = DownBlock(in_channels, 16)      # (B, 3, H, W) -> (B, 16, H/2, W/2)
+        self.down2 = DownBlock(16, 32)               # (B, 16, H/2, W/2) -> (B, 32, H/4, W/4)
+        
+        # Decoder (upsampling path)  
+        self.up1 = UpBlock(32, 16)                   # (B, 32, H/4, W/4) -> (B, 16, H/2, W/2)
+        self.up2 = UpBlock(16, 16)                   # (B, 16, H/2, W/2) -> (B, 16, H, W)
+        
+        # Task-specific heads
+        self.seg_head = nn.Conv2d(16, num_classes, kernel_size=1)  # (B, 16, H, W) -> (B, 3, H, W)
+        self.depth_head = nn.Sequential(
+            nn.Conv2d(16, 1, kernel_size=1),         # (B, 16, H, W) -> (B, 1, H, W)
+            nn.Sigmoid()                             # Constrain depth to [0, 1]
+        )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -119,11 +155,20 @@ class Detector(torch.nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # TODO: replace with actual forward pass
-        logits = torch.randn(x.size(0), 3, x.size(2), x.size(3))
-        raw_depth = torch.rand(x.size(0), x.size(2), x.size(3))
+        # Encoder (downsampling)
+        down1_out = self.down1(z)        # (B, 3, H, W) -> (B, 16, H/2, W/2)
+        down2_out = self.down2(down1_out)  # (B, 16, H/2, W/2) -> (B, 32, H/4, W/4)
+        
+        # Decoder (upsampling)
+        up1_out = self.up1(down2_out)    # (B, 32, H/4, W/4) -> (B, 16, H/2, W/2)
+        up2_out = self.up2(up1_out)      # (B, 16, H/2, W/2) -> (B, 16, H, W)
+        
+        # Task-specific heads
+        logits = self.seg_head(up2_out)   # (B, 16, H, W) -> (B, 3, H, W)
+        depth_raw = self.depth_head(up2_out)  # (B, 16, H, W) -> (B, 1, H, W)
+        depth = depth_raw.squeeze(1)      # (B, 1, H, W) -> (B, H, W)
 
-        return logits, raw_depth
+        return logits, depth
 
     def predict(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
