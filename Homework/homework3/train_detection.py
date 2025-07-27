@@ -13,6 +13,26 @@ from homework.datasets.road_dataset import load_data
 from homework.metrics import DetectionMetric
 
 
+class FocalLoss(nn.Module):
+    """Focal Loss for addressing class imbalance in segmentation"""
+    def __init__(self, alpha=None, gamma=2.0, weight=None):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+        
+    def forward(self, inputs, targets):
+        ce_loss = nn.functional.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.alpha is not None:
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_loss
+            
+        return focal_loss.mean()
+
+
 def train(
     exp_dir: str = "logs",
     model_name: str = "detector",
@@ -61,11 +81,20 @@ def train(
                         batch_size=batch_size,
                         num_workers=2)
 
-    # create loss functions and optimizer
-    # Cross-entropy for segmentation, MSE for depth regression
-    seg_loss_func = nn.CrossEntropyLoss()
+    # create loss functions and optimizer as specified in README
+    # Cross-entropy loss for segmentation with class weights to handle imbalance
+    # Calculate weights based on class frequency: background ~95%, lanes ~2.5% each
+    class_weights = torch.tensor([0.5, 20.0, 20.0]).to(device)  # Give much higher weight to lanes
+    seg_loss_func = nn.CrossEntropyLoss(weight=class_weights)
+    
+    # Regression loss for depth prediction (MSE as suggested)
     depth_loss_func = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    
+    # Use AdamW with weight decay for better generalization
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Add learning rate scheduling
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3, verbose=True)
 
     global_step = 0
     
@@ -97,10 +126,12 @@ def train(
             optimizer.zero_grad()  # clear gradients
             logits, depth_pred = model(img)  # forward pass
             
-            # Compute losses
+            # Compute losses with heavy emphasis on segmentation
             seg_loss = seg_loss_func(logits, track_mask)
             depth_loss = depth_loss_func(depth_pred, depth_gt)
-            total_loss = seg_loss + depth_loss  # Equal weighting of tasks
+            
+            # Weight segmentation much more heavily since it's the main evaluation metric
+            total_loss = 5.0 * seg_loss + depth_loss
             
             # Log individual losses
             logger.add_scalar("train_seg_loss", seg_loss.item(), global_step=global_step)
@@ -139,7 +170,7 @@ def train(
                 logits, depth_pred = model(img)
                 seg_loss = seg_loss_func(logits, track_mask)
                 depth_loss = depth_loss_func(depth_pred, depth_gt)
-                total_loss = seg_loss + depth_loss
+                total_loss = 5.0 * seg_loss + depth_loss
                 
                 epoch_val_seg_loss += seg_loss.item()
                 epoch_val_depth_loss += depth_loss.item()
@@ -190,6 +221,9 @@ def train(
             best_val_iou = epoch_val_iou
             save_model(model)
             print(f"New best model saved! Val IoU: {epoch_val_iou:.4f}")
+        
+        # Step the learning rate scheduler
+        scheduler.step(epoch_val_iou)
 
         # Print progress every epoch
         print(

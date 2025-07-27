@@ -95,15 +95,28 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    """Upsampling block with transpose conv + batchnorm + relu"""
-    def __init__(self, in_channels, out_channels):
+    """Upsampling block with transpose conv + batchnorm + relu + skip connections"""
+    def __init__(self, in_channels, out_channels, skip_channels=0):
         super().__init__()
         self.upconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
+        # If skip connections, we need to handle concatenated features
+        conv_in_channels = out_channels + skip_channels
+        self.conv = nn.Sequential(
+            nn.Conv2d(conv_in_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
         
-    def forward(self, x):
-        return self.relu(self.bn(self.upconv(x)))
+    def forward(self, x, skip=None):
+        x = self.upconv(x)
+        if skip is not None:
+            # Use interpolation to match exact dimensions
+            x = torch.nn.functional.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
+            x = torch.cat([x, skip], dim=1)
+        return self.conv(x)
 
 
 class Detector(torch.nn.Module):
@@ -124,18 +137,40 @@ class Detector(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN))
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD))
 
-        # Encoder (downsampling path)
-        self.down1 = DownBlock(in_channels, 16)      # (B, 3, H, W) -> (B, 16, H/2, W/2)
-        self.down2 = DownBlock(16, 32)               # (B, 16, H/2, W/2) -> (B, 32, H/4, W/4)
+        # Encoder (downsampling path) - simpler but effective
+        self.down1 = DownBlock(in_channels, 32)      # (B, 3, H, W) -> (B, 32, H/2, W/2)
+        self.down2 = DownBlock(32, 64)               # (B, 32, H/2, W/2) -> (B, 64, H/4, W/4)
         
-        # Decoder (upsampling path)  
-        self.up1 = UpBlock(32, 16)                   # (B, 32, H/4, W/4) -> (B, 16, H/2, W/2)
-        self.up2 = UpBlock(16, 16)                   # (B, 16, H/2, W/2) -> (B, 16, H, W)
+        # Bottleneck with more processing power
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(64, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True)
+        )
         
-        # Task-specific heads
-        self.seg_head = nn.Conv2d(16, num_classes, kernel_size=1)  # (B, 16, H, W) -> (B, 3, H, W)
+        # Decoder (upsampling path) with skip connections
+        self.up1 = UpBlock(64, 32, skip_channels=64)     # (B, 64, H/4, W/4) + skip -> (B, 32, H/2, W/2)
+        self.up2 = UpBlock(32, 32, skip_channels=32)     # (B, 32, H/2, W/2) + skip -> (B, 32, H, W)
+        
+        # Task-specific heads with final upsampling to ensure correct output size
+        self.seg_head = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
+            nn.Conv2d(16, num_classes, kernel_size=1)  # (B, 32, H, W) -> (B, 3, H, W)
+        )
         self.depth_head = nn.Sequential(
-            nn.Conv2d(16, 1, kernel_size=1),         # (B, 16, H, W) -> (B, 1, H, W)
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(16, 1, kernel_size=1),         # (B, 32, H, W) -> (B, 1, H, W)
             nn.Sigmoid()                             # Constrain depth to [0, 1]
         )
 
@@ -155,17 +190,25 @@ class Detector(torch.nn.Module):
         # optional: normalizes the input
         z = (x - self.input_mean[None, :, None, None]) / self.input_std[None, :, None, None]
 
-        # Encoder (downsampling)
-        down1_out = self.down1(z)        # (B, 3, H, W) -> (B, 16, H/2, W/2)
-        down2_out = self.down2(down1_out)  # (B, 16, H/2, W/2) -> (B, 32, H/4, W/4)
+        # Encoder (downsampling) - save features for skip connections
+        down1_out = self.down1(z)          # (B, 3, H, W) -> (B, 32, H/2, W/2)
+        down2_out = self.down2(down1_out)  # (B, 32, H/2, W/2) -> (B, 64, H/4, W/4)
         
-        # Decoder (upsampling)
-        up1_out = self.up1(down2_out)    # (B, 32, H/4, W/4) -> (B, 16, H/2, W/2)
-        up2_out = self.up2(up1_out)      # (B, 16, H/2, W/2) -> (B, 16, H, W)
+        # Bottleneck
+        bottleneck_out = self.bottleneck(down2_out)  # (B, 64, H/4, W/4) -> (B, 64, H/4, W/4)
+        
+        # Decoder (upsampling) with skip connections
+        up1_out = self.up1(bottleneck_out, down2_out)  # (B, 64, H/4, W/4) + skip -> (B, 32, H/2, W/2)
+        up2_out = self.up2(up1_out, down1_out)         # (B, 32, H/2, W/2) + skip -> (B, 32, H, W)
         
         # Task-specific heads
-        logits = self.seg_head(up2_out)   # (B, 16, H, W) -> (B, 3, H, W)
-        depth_raw = self.depth_head(up2_out)  # (B, 16, H, W) -> (B, 1, H, W)
+        logits = self.seg_head(up2_out)   # (B, 32, H/?, W/?) -> (B, 3, H/?, W/?)
+        depth_raw = self.depth_head(up2_out)  # (B, 32, H/?, W/?) -> (B, 1, H/?, W/?)
+        
+        # Ensure output matches input size exactly
+        target_size = (x.shape[2], x.shape[3])  # (H, W) from original input
+        logits = torch.nn.functional.interpolate(logits, size=target_size, mode='bilinear', align_corners=False)
+        depth_raw = torch.nn.functional.interpolate(depth_raw, size=target_size, mode='bilinear', align_corners=False)
         depth = depth_raw.squeeze(1)      # (B, 1, H, W) -> (B, H, W)
 
         return logits, depth
