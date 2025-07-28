@@ -13,25 +13,6 @@ from homework.datasets.road_dataset import load_data
 from homework.metrics import DetectionMetric
 
 
-class FocalLoss(nn.Module):
-    """Focal Loss for addressing class imbalance in segmentation"""
-    def __init__(self, alpha=None, gamma=2.0, weight=None):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.weight = weight
-        
-    def forward(self, inputs, targets):
-        ce_loss = nn.functional.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
-        pt = torch.exp(-ce_loss)
-        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
-        
-        if self.alpha is not None:
-            alpha_t = self.alpha[targets]
-            focal_loss = alpha_t * focal_loss
-            
-        return focal_loss.mean()
-
 
 def train(
     exp_dir: str = "logs",
@@ -82,13 +63,13 @@ def train(
                         num_workers=2)
 
     # create loss functions and optimizer as specified in README
-    # Cross-entropy loss for segmentation with class weights to handle imbalance
-    # Calculate weights based on class frequency: background ~95%, lanes ~2.5% each
-    class_weights = torch.tensor([0.5, 20.0, 20.0]).to(device)  # Give much higher weight to lanes
+    # Cross-entropy loss for segmentation with more balanced class weights
+    # Less extreme weights to avoid overfitting to minority classes
+    class_weights = torch.tensor([0.8, 10.0, 10.0]).to(device)  # Reduce extreme weighting
     seg_loss_func = nn.CrossEntropyLoss(weight=class_weights)
     
-    # Regression loss for depth prediction (MSE as suggested)
-    depth_loss_func = nn.MSELoss()
+    # Regression loss for depth prediction (L1Loss/MAE works better than MSE for outliers)
+    depth_loss_func = nn.L1Loss()  # Mean Absolute Error - a regression loss as specified
     
     # Use AdamW with weight decay for better generalization
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -130,8 +111,8 @@ def train(
             seg_loss = seg_loss_func(logits, track_mask)
             depth_loss = depth_loss_func(depth_pred, depth_gt)
             
-            # Weight segmentation much more heavily since it's the main evaluation metric
-            total_loss = 5.0 * seg_loss + depth_loss
+            # More balanced loss weighting
+            total_loss = 3.0 * seg_loss + depth_loss
             
             # Log individual losses
             logger.add_scalar("train_seg_loss", seg_loss.item(), global_step=global_step)

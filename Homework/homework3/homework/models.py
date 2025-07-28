@@ -83,32 +83,61 @@ class Classifier(nn.Module):
 
 
 class DownBlock(nn.Module):
-    """Downsampling block with conv + batchnorm + relu + stride"""
+    """Downsampling block with conv + batchnorm + relu + stride + residual connection"""
     def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
-        self.bn = nn.BatchNorm2d(out_channels)
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         
+        # Shortcut connection for residual
+        if in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=2, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Sequential(
+                nn.MaxPool2d(kernel_size=2, stride=2)
+            )
+        
     def forward(self, x):
-        return self.relu(self.bn(self.conv(x)))
+        residual = self.shortcut(x)
+        
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        out += residual  # Add residual connection
+        out = self.relu(out)
+        
+        return out
 
 
 class UpBlock(nn.Module):
-    """Upsampling block with transpose conv + batchnorm + relu + skip connections"""
+    """Upsampling block with transpose conv + batchnorm + relu + skip connections + residual"""
     def __init__(self, in_channels, out_channels, skip_channels=0):
         super().__init__()
         self.upconv = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=3, stride=2, padding=1, output_padding=1)
         # If skip connections, we need to handle concatenated features
         conv_in_channels = out_channels + skip_channels
-        self.conv = nn.Sequential(
-            nn.Conv2d(conv_in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+        
+        # Two conv blocks for residual connection
+        self.conv1 = nn.Conv2d(conv_in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Skip connection for residual - may need projection if channels differ
+        if conv_in_channels != out_channels:
+            self.residual_proj = nn.Sequential(
+                nn.Conv2d(conv_in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.residual_proj = nn.Identity()
         
     def forward(self, x, skip=None):
         x = self.upconv(x)
@@ -116,7 +145,18 @@ class UpBlock(nn.Module):
             # Use interpolation to match exact dimensions
             x = torch.nn.functional.interpolate(x, size=skip.shape[2:], mode='bilinear', align_corners=False)
             x = torch.cat([x, skip], dim=1)
-        return self.conv(x)
+            
+        # Store input for residual connection
+        residual = self.residual_proj(x)
+        
+        # Two conv blocks with residual connection
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        
+        # Add residual connection
+        out = self.relu(out + residual)
+        
+        return out
 
 
 class Detector(torch.nn.Module):
@@ -141,15 +181,12 @@ class Detector(torch.nn.Module):
         self.down1 = DownBlock(in_channels, 32)      # (B, 3, H, W) -> (B, 32, H/2, W/2)
         self.down2 = DownBlock(32, 64)               # (B, 32, H/2, W/2) -> (B, 64, H/4, W/4)
         
-        # Bottleneck with more processing power
+        # Simplified bottleneck to reduce computation
         self.bottleneck = nn.Sequential(
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(64, 96, kernel_size=3, padding=1),
+            nn.BatchNorm2d(96),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.Conv2d(96, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True)
         )
