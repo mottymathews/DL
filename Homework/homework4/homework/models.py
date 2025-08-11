@@ -87,7 +87,7 @@ class TransformerPlanner(nn.Module):
         self,
         n_track: int = 10,
         n_waypoints: int = 3,
-        d_model: int = 64,
+        d_model: int = 64,  # Match saved model architecture
     ):
         super().__init__()
 
@@ -98,24 +98,80 @@ class TransformerPlanner(nn.Module):
         # Learned query embeddings for waypoints (Perceiver-style)
         self.query_embed = nn.Embedding(n_waypoints, d_model)
         
-        # Input projection for track points
+        # Simple input projection for track points
         self.input_projection = nn.Linear(2, d_model)
         
         # Positional encoding for track points
-        self.pos_embed = nn.Parameter(torch.randn(2 * n_track, d_model))
+        self.pos_embed = nn.Parameter(torch.zeros(2 * n_track, d_model))
         
         # Transformer decoder layers for cross-attention
         decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=8,  # 8 heads with d_model=64 gives 8 dims per head
+            dim_feedforward=512,  # Keep feedforward dimension
+            dropout=0.1,
+            batch_first=True
+        )
+        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)  # Match saved model (0,1,2,3 = 4 layers)
+        
+        # Add waypoint self-attention for better waypoint relationships
+        self.waypoint_self_attention = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=8,
             dim_feedforward=256,
             dropout=0.1,
             batch_first=True
         )
-        self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=4)
         
-        # Output projection to waypoint coordinates
-        self.output_projection = nn.Linear(d_model, 2)
+        # Separate heads for longitudinal and lateral prediction
+        self.longitudinal_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.05),
+            nn.Linear(d_model // 2, 1)  # Only x-coordinate (longitudinal)
+        )
+        
+        self.lateral_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.ReLU(),
+            nn.Dropout(0.05),  # Lower dropout for lateral precision
+            nn.Linear(d_model // 2, d_model // 4),
+            nn.ReLU(),
+            nn.Linear(d_model // 4, 1)  # Only y-coordinate (lateral) with extra precision layer
+        )
+        
+        # Initialize weights properly
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights with careful initialization for Transformer."""
+        # Initialize input projection with Xavier uniform (standard)
+        nn.init.xavier_uniform_(self.input_projection.weight)
+        nn.init.zeros_(self.input_projection.bias)
+        
+        # Initialize longitudinal head layers
+        for i, layer in enumerate(self.longitudinal_head):
+            if isinstance(layer, nn.Linear):
+                if i == len(self.longitudinal_head) - 1:  # Final layer
+                    nn.init.xavier_uniform_(layer.weight, gain=0.1)
+                else:
+                    nn.init.xavier_uniform_(layer.weight, gain=0.5)
+                nn.init.zeros_(layer.bias)
+        
+        # Initialize lateral head layers with very careful initialization
+        for i, layer in enumerate(self.lateral_head):
+            if isinstance(layer, nn.Linear):
+                if i == len(self.lateral_head) - 1:  # Final layer - most critical
+                    nn.init.xavier_uniform_(layer.weight, gain=0.05)  # Very small for lateral precision
+                else:
+                    nn.init.xavier_uniform_(layer.weight, gain=0.3)  # Conservative
+                nn.init.zeros_(layer.bias)
+        
+        # Initialize query embeddings with small values
+        nn.init.normal_(self.query_embed.weight, mean=0, std=0.02)
+        
+        # Initialize positional encoding with small random values
+        nn.init.normal_(self.pos_embed, mean=0, std=0.02)
 
     def forward(
         self,
@@ -138,24 +194,40 @@ class TransformerPlanner(nn.Module):
         """
         batch_size = track_left.shape[0]
         
-        # Concatenate left and right tracks
-        track_points = torch.cat([track_left, track_right], dim=1)  # (b, 2*n_track, 2)
+        # Compute track center explicitly for better spatial understanding
+        track_center = (track_left + track_right) / 2  # (b, n_track, 2)
+        
+        # Concatenate left, right, and center tracks for richer spatial info
+        track_points = torch.cat([track_left, track_right, track_center], dim=1)  # (b, 3*n_track, 2)
         
         # Project track points to d_model dimensions
-        track_features = self.input_projection(track_points)  # (b, 2*n_track, d_model)
+        track_features = self.input_projection(track_points)  # (b, 3*n_track, d_model)
+        
+        # Expand positional encoding for the additional center points
+        pos_embed_expanded = torch.cat([
+            self.pos_embed,  # Original left+right positions
+            self.pos_embed[:self.n_track]  # Center positions (reuse left positions)
+        ], dim=0)  # (3*n_track, d_model)
         
         # Add positional encoding
-        track_features = track_features + self.pos_embed.unsqueeze(0)  # (b, 2*n_track, d_model)
+        track_features = track_features + pos_embed_expanded.unsqueeze(0)  # (b, 3*n_track, d_model)
         
         # Get query embeddings for waypoints
         queries = self.query_embed.weight.unsqueeze(0).expand(batch_size, -1, -1)  # (b, n_waypoints, d_model)
         
         # Apply transformer decoder (cross-attention)
-        # queries attend to track_features
+        # queries attend to track_features (left + right + center)
         waypoint_features = self.transformer_decoder(queries, track_features)  # (b, n_waypoints, d_model)
         
-        # Project to waypoint coordinates
-        waypoints = self.output_projection(waypoint_features)  # (b, n_waypoints, 2)
+        # Apply waypoint self-attention for better waypoint relationships
+        waypoint_features = self.waypoint_self_attention(waypoint_features)  # (b, n_waypoints, d_model)
+        
+        # Separate prediction for longitudinal and lateral components
+        longitudinal = self.longitudinal_head(waypoint_features).squeeze(-1)  # (b, n_waypoints)
+        lateral = self.lateral_head(waypoint_features).squeeze(-1)  # (b, n_waypoints)
+        
+        # Combine into waypoints
+        waypoints = torch.stack([longitudinal, lateral], dim=-1)  # (b, n_waypoints, 2)
         
         return waypoints
 
@@ -172,46 +244,48 @@ class CNNPlanner(torch.nn.Module):
         self.register_buffer("input_mean", torch.as_tensor(INPUT_MEAN), persistent=False)
         self.register_buffer("input_std", torch.as_tensor(INPUT_STD), persistent=False)
 
-        # CNN backbone - similar to image classification models
+        # CNN backbone - more efficient architecture
         self.backbone = nn.Sequential(
             # First conv block
             nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.1),
             nn.MaxPool2d(kernel_size=2, stride=2),  # 96x128 -> 48x64
             
             # Second conv block  
             nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.15),
             nn.MaxPool2d(kernel_size=2, stride=2),  # 48x64 -> 24x32
             
-            # Third conv block
+            # Third conv block - reduced channels
             nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
+            nn.Dropout2d(0.2),
             nn.MaxPool2d(kernel_size=2, stride=2),  # 24x32 -> 12x16
             
-            # Fourth conv block
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),  # 12x16 -> 6x8
+            # Remove the fourth conv block to reduce model size
+            # Direct global pooling instead
+            nn.AdaptiveAvgPool2d((4, 4)),  # 12x16 -> 4x4
         )
         
-        # Calculate flattened size: 256 channels * 6 * 8 = 12288
-        self.flattened_size = 256 * 6 * 8
+        # Calculate flattened size: 128 channels * 4 * 4 = 2048 (much smaller!)
+        self.flattened_size = 128 * 4 * 4
         
-        # Fully connected layers to predict waypoints
+        # Smaller fully connected layers 
         self.head = nn.Sequential(
             nn.Flatten(),
-            nn.Linear(self.flattened_size, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.5),
-            nn.Linear(512, 256),
+            nn.Dropout(0.4),
+            nn.Linear(self.flattened_size, 256),  # Reduced from 512
             nn.ReLU(inplace=True),
             nn.Dropout(0.3),
-            nn.Linear(256, n_waypoints * 2),  # n_waypoints * 2 for (x, y) coordinates
+            nn.Linear(256, 64),  # Smaller intermediate layer
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(64, n_waypoints * 2),  # Final layer to waypoints
         )
 
     def forward(self, image: torch.Tensor, **kwargs) -> torch.Tensor:

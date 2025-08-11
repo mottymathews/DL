@@ -2,7 +2,15 @@
 Training script for Homework 4 - Planners
 
 Usage:
-    python3 -m homework.train_planner --model mlp_planner --epochs 50 --batch_size 64
+    python3     # Create model
+    if args.model == 'mlp':
+        model = MLPPlanner().to(device)
+    elif args.model == 'transformer':
+        model = TransformerPlanner(d_model=64).to(device)  # Match saved model architecture
+    elif args.model == 'cnn':
+        model = CNNPlanner().to(device)
+    else:
+        raise ValueError(f"Unknown model: {args.model}")ain_planner --model mlp_planner --epochs 50 --batch_size 64
     python3 -m homework.train_planner --model transformer_planner --epochs 100 --batch_size 32
     python3 -m homework.train_planner --model cnn_planner --epochs 75 --batch_size 32
 """
@@ -70,7 +78,7 @@ def train(
         # For MLP and Transformer, use state_only pipeline (no images)
         transform_pipeline = "state_only"
     elif model_name == "transformer_planner":
-        model = TransformerPlanner(n_track=10, n_waypoints=3, d_model=64)
+        model = TransformerPlanner(n_track=10, n_waypoints=3, d_model=128)  # Match updated architecture
         transform_pipeline = "state_only"
     elif model_name == "cnn_planner":
         model = CNNPlanner(n_waypoints=3)
